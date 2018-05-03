@@ -29,6 +29,18 @@ const FAILED = "failed"
 const YIELD = "yield"
 
 
+type Request struct {
+    nodeId int
+    timestamp int
+}
+
+
+type State struct {
+  locked bool
+  request Request
+  inCS bool // process is in CS
+  localTime int //logical time according to leslie
+}
 
 func criticalSection( id int ){
   fmt.Printf( "Node %d entering criticalSection", id )
@@ -45,17 +57,12 @@ func create( id int, done chan bool ){
       fmt.Print( "FUCK" )
     }
 
-    locked := false
-    waitingForCS := false
+    state := State{ false, Request{}, false, 0 } // initial state of the node
 
-    var quorumSet []int
-    buildQuorumSet( &quorumSet )
-
-    var lockedQueue []int
-    var requestQueue []int
+    quorumSet := buildQuorumSet()
+    lockedQueue := make( []int, 0 )
+    requestQueue := make( []int, 0 )
     var mutex = &sync.Mutex{}
-    logicalTime := 0 // logical timestamp
-
     //server
     go func(){
       for{
@@ -75,10 +82,10 @@ func create( id int, done chan bool ){
           // update logical clock
           senderTimestamp, _ := strconv.Atoi( splits[ 0 ] )
           mutex.Lock()
-          if logicalTime + 1 < senderTimestamp {
-            logicalTime = senderTimestamp
+          if state.localTime + 1 < senderTimestamp {
+            state.localTime = senderTimestamp
           } else{
-            logicalTime ++
+            state.localTime ++
           }
           mutex.Unlock()
 
@@ -90,27 +97,36 @@ func create( id int, done chan bool ){
           case REQUEST:
               // id
               senderId, _ := strconv.Atoi( splits[ 2 ] )
-              if locked {
-                locked = true
+              if ! state.locked {
+                mutex.Lock()
+                state.locked = true
+                state.request = Request{ senderId, senderTimestamp }
+                mutex.Unlock()
                 message := LOCKED + ";" + strconv.Itoa( id )
-                sendMessage( mutex, logicalTime, idToPort( senderId ), message )
+                sendMessage( mutex, state, idToPort( senderId ), message )
               }else{
-                push( &requestQueue, senderId, mutex )
+                mutex.Lock()
+                requestQueue = append( requestQueue, senderId )
+                mutex.Unlock()
               }
           case LOCKED:
               senderId, _ := strconv.Atoi( splits[ 2 ] )
-              push( &lockedQueue, senderId, mutex )
+              mutex.Lock()
+              lockedQueue = append( lockedQueue, senderId )
+              mutex.Unlock()
               //all locks have been recieved
               if len( lockedQueue ) == len( quorumSet ){
                 go func() {
                   criticalSection( id )
                   mutex.Lock()
-                  waitingForCS = false
-                  //empyt the lockedQueue
-                  lockedQueue = lockedQueue[ len( lockedQueue ) -1 : ]
+                  state.inCS = false
                   mutex.Unlock()
-                }
+                }()
               }
+              //empyt the lockedQueue
+              mutex.Lock()
+              lockedQueue = lockedQueue[ len( lockedQueue ) -1 : ]
+              mutex.Unlock()
 
           default:
             panic( fmt.Sprintf( "protocol violation: %s", cmd ) )
@@ -127,29 +143,25 @@ func create( id int, done chan bool ){
         delay := rand.Intn( 4 ) + 1
         fmt.Printf( "%d is sleeping for %d \n", id, delay  )
         time.Sleep( time.Duration( delay ) * time.Second )
-        for locked  {
-          // might as well do nothing
-        }
+        for state.locked  { /* might as well do nothing  */  }
 
         for i := 0; i < len( quorumSet ); i ++ {
           reciver := quorumSet[ i ]
           fmt.Printf( "%d is conntecting ot %d \n", id, startPort + reciver  )
           conn, err := net.Dial( "tcp", "127.0.0.1:" + strconv.Itoa( startPort + reciver ) )
-          if err != nil {
-            fmt.Print( "sent failed" )
-          }
+          if err != nil { fmt.Print( "sent failed" ) }
 
           //update logical clock and send message
           mutex.Lock()
-          logicalTime ++
-          fmt.Fprintf( conn, "%d;%s;%d\n", logicalTime, REQUEST, id  )
+          state.localTime ++
+          fmt.Fprintf( conn, "%d;%s;%d\n", state.localTime, REQUEST, id  )
           mutex.Unlock()
         }
         //waiting until we executed the CS before we do request it again
         mutex.Lock()
-        waitingForCS = true
+        state.inCS = true
         mutex.Unlock()
-        for waitingForCS {
+        for state.inCS {
           // might as well do nothing
         }
       }
@@ -157,46 +169,50 @@ func create( id int, done chan bool ){
 
 }
 
-func int idToPort( id int ){
+
+func idToPort( id int ) int {
   return startPort + id
 }
 
-func sendMessage( mutex *sync.Mutex ,logical_time int, port int, message string){
-  conn, err := net.Dial( "tcp", "127.0.0.1:" + strconv.Itoa( startPort + reciver ) )
+func sendMessage( mutex *sync.Mutex, state State, port int, message string){
+  fmt.Print( "sending message %s", message )
+  conn, err := net.Dial( "tcp", "127.0.0.1:" + strconv.Itoa( port ) )
   if err != nil {
     fmt.Print( "sent failed" )
   }
 
   //update logical clock and send message
   mutex.Lock()
-  logicalTime ++
-  fmt.Fprintf( conn, "%d;%s", logicalTime, message  )
+  state.localTime ++
+
+  fmt.Fprintf( conn, "%d;%s", state.localTime, message  )
   mutex.Unlock()
 }
 
-func push( queue *[]int, value int, mutex *sync.Mutex ) {
-  mutex.Lock()
-  *queue = append( *queue, value )
-  mutex.Unlock()
-}
+// func push( queue []int, value int, mutex *sync.Mutex ) {
+//   mutex.Lock()
+//   *queue = append( *queue, value )
+//   mutex.Unlock()
+// }
+//
+// func pop( queue []int, mutex *sync.Mutex ) int {
+//   mutex.Lock()
+//   defer mutex.Unlock()
+//   if len( queue ) == 0{
+//     return nil
+//   }
+//   var value int
+//   value, *queue = queue[ 0 ], queue[ 1: ]
+//   return value
+// }
 
-func pop( queue *[]int, mutex *sync.Mutex ) {
-  mutex.Lock()
-  defer mutex.Unlock()
-  if len( s ) == 0{
-    return nil
-  }
-  var value int
-  value, *queue = queue[ 0 ], queue[ 1: ]
-  return value
-}
-
-func buildQuorumSet( quorumSet *[]int ) {
+func buildQuorumSet() []int {
   // FIXME eventually this should build proper sets
-  *quorumSet = [ N ]int
+  quorumSet := make( []int, N )
   for i := 0; i < N; i ++ {
     quorumSet[ i ] = i
   }
+  return quorumSet
 }
 
 func main() {
