@@ -11,7 +11,7 @@ import(
   "strings"
 )
 
-const N = 5
+const N = 3
 const startPort = 14000
 
 // all messages start with a timestamp as the first "argument"
@@ -26,11 +26,11 @@ const RELINQUISH = "relinquish" // id
 const LOCKED = "locked" // id
 const RELEASE = "rlease" // id
 const FAILED = "failed"
-const YIELD = "yield"
+
 
 
 type Request struct {
-    nodeId int
+    id int
     timestamp int
 }
 
@@ -40,28 +40,30 @@ type State struct {
   request Request
   inCS bool // process is in CS
   localTime int //logical time according to leslie
+  recievedFail bool
+  recievedInquire bool
 }
 
 func criticalSection( id int ){
-  fmt.Printf( "Node %d entering criticalSection", id )
+  fmt.Printf( "Node %d entering criticalSection\n", id )
   time.Sleep( time.Duration( rand.Intn( 4 ) + 1 ) * time.Second )
-  fmt.Printf( "Node %d leaving criticalSection", id )
+  fmt.Printf( "Node %d leaving criticalSection\n", id )
 }
 
 
 func create( id int, done chan bool ){
-    fmt.Printf( "creating id: %d \n", id )
     port := startPort + id
+    fmt.Printf( "creating id: %d \n\t listening on port %d\n", id, port )
     lisnter, err := net.Listen( "tcp", ":" + strconv.Itoa( port )  )
     if err != nil {
       fmt.Print( "FUCK" )
     }
 
-    state := State{ false, Request{}, false, 0 } // initial state of the node
+    state := State{ false, Request{}, false, 0, false, false } // initial state of the node
 
-    quorumSet := buildQuorumSet()
+    quorumSet := buildQuorumSet( id )
     lockedQueue := make( []int, 0 )
-    requestQueue := make( []int, 0 )
+    requestQueue := make( []Request, 0 )
     var mutex = &sync.Mutex{}
     //server
     go func(){
@@ -93,24 +95,42 @@ func create( id int, done chan bool ){
 
           // interpret message
           cmd := splits[ 1 ]
+          senderId, _ := strconv.Atoi( splits[ 2 ] )
           switch cmd {
           case REQUEST:
-              // id
-              senderId, _ := strconv.Atoi( splits[ 2 ] )
+              request := Request{ senderId, senderTimestamp }
               if ! state.locked {
                 mutex.Lock()
                 state.locked = true
-                state.request = Request{ senderId, senderTimestamp }
+                state.request = request
                 mutex.Unlock()
                 message := LOCKED + ";" + strconv.Itoa( id )
                 sendMessage( mutex, state, idToPort( senderId ), message )
-              }else{
+              } else {
                 mutex.Lock()
-                requestQueue = append( requestQueue, senderId )
+                requestQueue = append( requestQueue, request )
                 mutex.Unlock()
               }
+              mutex.Lock()
+              // other things go first
+              failed := preceeds( state.request, request )
+              for i:= 0; i < len( requestQueue ); i++ {
+                  if failed || preceeds( requestQueue[ i ], request ){
+                    failed = true
+                    break
+                  }
+              }
+                mutex.Unlock()
+
+                if failed {
+                  message := FAILED + ";" + strconv.Itoa( id )
+                  sendMessage( mutex, state, idToPort( senderId ), message )
+                  return
+                }
+
+                // ask the locking request to chill out
+                sendMessage( mutex, state, idToPort( senderId ), INQUIRE )
           case LOCKED:
-              senderId, _ := strconv.Atoi( splits[ 2 ] )
               mutex.Lock()
               lockedQueue = append( lockedQueue, senderId )
               mutex.Unlock()
@@ -127,6 +147,44 @@ func create( id int, done chan bool ){
               mutex.Lock()
               lockedQueue = lockedQueue[ len( lockedQueue ) -1 : ]
               mutex.Unlock()
+          case FAILED:
+              if state.recievedInquire {
+                sendMessage( mutex, state, idToPort( senderId ), RELINQUISH )
+              }
+              mutex.Lock()
+              state.recievedFail = true
+              mutex.Unlock()
+          case INQUIRE:
+              if state.recievedFail {
+                sendMessage( mutex, state, idToPort( senderId ), RELINQUISH )
+              }
+              state.recievedInquire = true
+          case RELINQUISH:
+              mutex.Lock()
+              tempRequest := state.request
+              if len( requestQueue ) > 0 {
+                  state.request = requestQueue[ 0 ]
+                  requestQueue[ 0 ] = tempRequest
+              } else {
+                  state.locked = false
+              }
+              state.recievedFail = false
+              state.recievedInquire = false
+              mutex.Unlock()
+              if state.locked {
+                  sendMessage( mutex, state, idToPort( state.request.id ), LOCKED )
+              }
+          case RELEASE:
+              mutex.Lock()
+              if len( requestQueue ) > 0 {
+                  state.request = requestQueue[ 0 ]
+                  requestQueue = requestQueue [ 1: ]
+              } else {
+                  state.locked = false
+              }
+              state.recievedFail = false
+              state.recievedInquire = false
+              mutex.Unlock()
 
           default:
             panic( fmt.Sprintf( "protocol violation: %s", cmd ) )
@@ -139,23 +197,23 @@ func create( id int, done chan bool ){
     // client
     // tries to enter the criticalSection
     go func(){
-      for{
+      for {
         delay := rand.Intn( 4 ) + 1
         fmt.Printf( "%d is sleeping for %d \n", id, delay  )
         time.Sleep( time.Duration( delay ) * time.Second )
         for state.locked  { /* might as well do nothing  */  }
 
-        for i := 0; i < len( quorumSet ); i ++ {
-          reciver := quorumSet[ i ]
-          fmt.Printf( "%d is conntecting ot %d \n", id, startPort + reciver  )
-          conn, err := net.Dial( "tcp", "127.0.0.1:" + strconv.Itoa( startPort + reciver ) )
-          if err != nil { fmt.Print( "sent failed" ) }
+        //locking myself
+        mutex.Lock()
+        state.locked = true
+        state.localTime ++
+        state.request = Request{ id, state.localTime }
+        mutex.Unlock()
 
-          //update logical clock and send message
-          mutex.Lock()
-          state.localTime ++
-          fmt.Fprintf( conn, "%d;%s;%d\n", state.localTime, REQUEST, id  )
-          mutex.Unlock()
+        for i := 0; i < len( quorumSet ); i ++ {
+          reciverPort := idToPort( quorumSet[ i ] )
+          message := REQUEST + ";" + strconv.Itoa( id )
+          sendMessage( mutex, state, reciverPort, message )
         }
         //waiting until we executed the CS before we do request it again
         mutex.Lock()
@@ -175,7 +233,6 @@ func idToPort( id int ) int {
 }
 
 func sendMessage( mutex *sync.Mutex, state State, port int, message string){
-  fmt.Print( "sending message %s", message )
   conn, err := net.Dial( "tcp", "127.0.0.1:" + strconv.Itoa( port ) )
   if err != nil {
     fmt.Print( "sent failed" )
@@ -184,8 +241,8 @@ func sendMessage( mutex *sync.Mutex, state State, port int, message string){
   //update logical clock and send message
   mutex.Lock()
   state.localTime ++
-
-  fmt.Fprintf( conn, "%d;%s", state.localTime, message  )
+  fmt.Printf( "sending message: %d;%s \n", state.localTime, message )
+  fmt.Fprintf( conn, "%d;%s\n", state.localTime, message  )
   mutex.Unlock()
 }
 
@@ -206,13 +263,25 @@ func sendMessage( mutex *sync.Mutex, state State, port int, message string){
 //   return value
 // }
 
-func buildQuorumSet() []int {
+func buildQuorumSet( id int ) []int {
   // FIXME eventually this should build proper sets
-  quorumSet := make( []int, N )
-  for i := 0; i < N; i ++ {
-    quorumSet[ i ] = i
+  quorumSet := make( []int, N -1 )
+  tempId := 0
+  for i := 0; i < N - 1; {
+    if tempId == id {
+      tempId ++
+      continue
+    }
+    quorumSet[ i ] = tempId
+    tempId ++
+    i ++
   }
   return quorumSet
+}
+
+/* does r1 precced r2  */
+func preceeds( r1 Request, r2 Request ) bool {
+  return r1.timestamp < r2.timestamp || ( r1.timestamp == r2.timestamp && r1.id <= r2.id )
 }
 
 func main() {
